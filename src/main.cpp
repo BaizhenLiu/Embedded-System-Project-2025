@@ -1,5 +1,7 @@
 #include "mbed.h"
 #include "arm_math.h" 
+#include <cmath>
+#include <chrono>
 
 
 I2C i2c(PB_11, PB_10);  // I2C2: SDA = PB11, SCL = PB10
@@ -32,11 +34,15 @@ FileHandle *mbed::mbed_override_console(int) {
 #define OUTZ_H_G    0x27  // Gyro Z-axis (high byte)
 //FFT
 #define FFT_SIZE 256
-#define SAMPLE_RATE 10000.0f
+// #define SAMPLE_RATE 10000.0f
+#define SAMPLE_RATE 104.0f 
 
-float32_t input_fft[FFT_SIZE];
-float32_t fft_out[FFT_SIZE];
-float32_t magnitude[FFT_SIZE / 2];
+float32_t input_acc[FFT_SIZE];
+float32_t input_gyro[FFT_SIZE];
+
+static float32_t fft_out[FFT_SIZE];        // 中间复数输出  
+static float32_t mag_acc[FFT_SIZE/2];      // 加速度 FFT 幅值  
+static float32_t mag_gyro[FFT_SIZE/2]; 
 
 arm_rfft_fast_instance_f32 FFT_Instance;
 
@@ -103,29 +109,71 @@ float tranformGyroscope(int16_t gyro_raw){
     return gyro_dps;
 }
 //进行FFT变换
-void run_fft() {
-    arm_rfft_fast_f32(&FFT_Instance, input_fft, fft_out, 0);  
-    arm_cmplx_mag_f32(fft_out, magnitude, FFT_SIZE / 2);      
+// void run_fft() {
+//     arm_rfft_fast_f32(&FFT_Instance, input_fft, fft_out, 0);  
+//     arm_cmplx_mag_f32(fft_out, magnitude, FFT_SIZE / 2);      
+// }
+
+// void show_results() {
+//     float resolution = SAMPLE_RATE / FFT_SIZE;  
+
+//     printf("Bin\tFreq (Hz)\tMagnitude\n");
+//     for (int i = 0; i < 28; i++) {
+//         printf(" %d\t%.2f\t\t%.4f\n", i, i * resolution, magnitude[i]);
+//     }
+
+//     uint32_t max_index = 0;
+//     float32_t max_val = 0.0f;
+//     arm_max_f32(magnitude, FFT_SIZE/2, &max_val, &max_index);  
+
+//     printf("Peak Frequency: %.2f Hz\n\n", max_index * resolution);
+//     printf("Max magnitude: %.1f at bin %lu (%.2f Hz)\r\n", 
+//         max_val, max_index, max_index * resolution);  
+// }
+void computeFFT(const float32_t input[], float32_t mag_out[]) {
+    // 实时执行 FFT
+    arm_rfft_fast_f32(&FFT_Instance, const_cast<float32_t*>(input), fft_out, 0);
+    // 复数 -> 幅值
+    arm_cmplx_mag_f32(fft_out, mag_out, FFT_SIZE/2);
 }
+struct Detection {
+    bool detected;
+    float freq;
+    float magnitude;
+};
 
-void show_results() {
-    float resolution = SAMPLE_RATE / FFT_SIZE;  
+// 震颤检测：先 FFT，再找峰，再判频段 
+Detection detectTremorFFT(const float32_t acc_buf[]) {
+    // 先做 FFT
+    computeFFT(acc_buf, mag_acc);
 
-    printf("Bin\tFreq (Hz)\tMagnitude\n");
-    for (int i = 0; i < 28; i++) {
-        printf(" %d\t%.2f\t\t%.4f\n", i, i * resolution, magnitude[i]);
-    }
+    // 找峰值
+    uint32_t idx; float32_t val;
+    arm_max_f32(mag_acc, FFT_SIZE/2, &val, &idx);
 
-    uint32_t max_index = 0;
-    float32_t max_val = 0.0f;
-    arm_max_f32(magnitude, FFT_SIZE/2, &max_val, &max_index);  
+    // 填结果
+    Detection d;
+    d.freq      = idx * (SAMPLE_RATE / FFT_SIZE);
+    d.magnitude = val;
+    d.detected  = (d.freq >= 3.0f && d.freq <= 5.0f);
+    return d;
+}
+// 舞蹈症检测：同上 
+Detection detectDyskinesiaFFT(const float32_t gyro_buf[]) {
+    computeFFT(gyro_buf, mag_gyro);
 
-    printf("Peak Frequency: %.2f Hz\n\n", max_index * resolution);
-    printf("Max magnitude: %.1f at bin %lu (%.2f Hz)\r\n", 
-        max_val, max_index, max_index * resolution);  
+    uint32_t idx; float32_t val;
+    arm_max_f32(mag_gyro, FFT_SIZE/2, &val, &idx);
+
+    Detection d;
+    d.freq      = idx * (SAMPLE_RATE / FFT_SIZE);
+    d.magnitude = val;
+    d.detected  = (d.freq > 5.0f && d.freq <= 7.0f);
+    return d;
 }
 
 int main(){
+
     //初始化硬件
     init_I2C();
 
@@ -134,8 +182,10 @@ int main(){
 
     // 配置传感器
     configure_sensor();
-
+    //初始化 ARM FFT 实例
+    arm_rfft_fast_init_f32(&FFT_Instance, FFT_SIZE);
     int index = 0; 
+    constexpr auto SAMPLE_PERIOD = 1000ms / 104;
 
     while(1){
         //收集打印数据
@@ -160,22 +210,32 @@ int main(){
             acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps);
         
         //进行频谱分析
-        input_fft[index] = acc_x_g;  // 填充 X 轴数据
+        //xyz方向数据融合
+        float acc_mag = sqrt(acc_x_g * acc_x_g + acc_y_g * acc_y_g + acc_z_g * acc_z_g);
+        float gyro_mag = sqrt(gyro_x_dps * gyro_x_dps + gyro_y_dps * gyro_y_dps + gyro_z_dps * gyro_z_dps);
 
+        //填入各自缓冲
+        input_acc[index]  = acc_mag;
+        input_gyro[index] = gyro_mag;
         index++;
 
         // 如果填充满了整个 FFT 数组，执行 FFT
         if (index >= FFT_SIZE) {
-            // 进行 FFT 变换
-            run_fft();
-            // 显示 FFT 结果
-            show_results();
-
-            // 重置索引，准备下一个采样周期
+            Detection tremor = detectTremorFFT(input_acc);
+            Detection dysk  = detectDyskinesiaFFT(input_gyro);
             index = 0;
-        }   
+            if (tremor.detected) {
+                
+            }
+        
+            // 根据 dysk.detected / dysk.magnitude 做陀螺指示
+            if (dysk.detected) {
+                
+            }
+        }
+           
         // 等待下一次采样
-        ThisThread::sleep_for(200ms);
+        ThisThread::sleep_for(SAMPLE_PERIOD);
 
     }
 
