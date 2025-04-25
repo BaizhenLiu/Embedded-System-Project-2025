@@ -2,6 +2,7 @@
 #include "arm_math.h" 
 #include <cmath>
 #include <chrono>
+using namespace std::chrono_literals;
 
 
 I2C i2c(PB_11, PB_10);  // I2C2: SDA = PB11, SCL = PB10
@@ -186,6 +187,7 @@ int main(){
     arm_rfft_fast_init_f32(&FFT_Instance, FFT_SIZE);
     int index = 0; 
     constexpr auto SAMPLE_PERIOD = 1000ms / 104;
+    //精度有误差，后续需要调整
 
     while(1){
         //收集打印数据
@@ -225,12 +227,12 @@ int main(){
             Detection dysk  = detectDyskinesiaFFT(input_gyro);
             index = 0;
             if (tremor.detected) {
-                
+                printf("[Tremor Detected] Peak Frequency: %.2f Hz | Magnitude: %.4f\r\n", tremor.freq, tremor.magnitude);
             }
         
             // 根据 dysk.detected / dysk.magnitude 做陀螺指示
             if (dysk.detected) {
-                
+                printf("[Dyskinesia Detected] Peak Frequency: %.2f Hz | Magnitude: %.4f\r\n", dysk.freq, dysk.magnitude);
             }
         }
            
