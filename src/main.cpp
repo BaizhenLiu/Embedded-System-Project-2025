@@ -89,12 +89,16 @@ void checkconnection(){
 }
 
 void configure_sensor() {
-    // 配置加速度计和陀螺仪的采样频率与量程
-    write_register(CTRL1_XL, 0x40);  // 加速度计配置
-    printf("Accelerometer configured: 104 Hz, ±2g range\r\n");
-    write_register(CTRL2_G, 0x40);   // 陀螺仪配置
-    printf("Gyroscope configured: 104 Hz, ±250 dps range\r\n");
+    write_register(CTRL1_XL, 0x40);  
+    write_register(CTRL2_G, 0x40);   
+
+    // 读取回寄存器验证是否写成功
+    uint8_t xl_conf = read_register(CTRL1_XL);
+    uint8_t g_conf = read_register(CTRL2_G);
+    printf("CTRL1_XL = 0x%02X (expect 0x40)\r\n", xl_conf);
+    printf("CTRL2_G  = 0x%02X (expect 0x40)\r\n", g_conf);
 }
+
 //将没有实际物理意义的数值转换为真实的物理数值
 const float ACC_SENSITIVITY = 0.061f;  // mg/LSB for ±2g range
 const float GYRO_SENSITIVITY = 8.75f;  // mdps/LSB for ±250 dps range
@@ -131,11 +135,20 @@ float tranformGyroscope(int16_t gyro_raw){
 //     printf("Max magnitude: %.1f at bin %lu (%.2f Hz)\r\n", 
 //         max_val, max_index, max_index * resolution);  
 // }
+//函数正确，检测mag_out有数值且小于1000，并且在左右摆动时度数有明显变化，大于10,000
 void computeFFT(const float32_t input[], float32_t mag_out[]) {
     // 实时执行 FFT
     arm_rfft_fast_f32(&FFT_Instance, const_cast<float32_t*>(input), fft_out, 0);
     // 复数 -> 幅值
     arm_cmplx_mag_f32(fft_out, mag_out, FFT_SIZE/2);
+
+    // for (int i = 0; i < FFT_SIZE / 2; i++) {
+    //     // 将幅值放大1000倍后转为整数
+    //     int mag_int = (int)(mag_out[i] * 1000);
+    
+    //     // 打印带有三位小数的幅值
+    //     printf("FFT Bin %d: %d.%03d\n", i, mag_int / 1000, mag_int % 1000);
+    // }
 }
 struct Detection {
     bool detected;
@@ -143,37 +156,124 @@ struct Detection {
     float magnitude;
 };
 
-// 震颤检测：先 FFT，再找峰，再判频段 
 Detection detectTremorFFT(const float32_t acc_buf[]) {
-    // 先做 FFT
-    computeFFT(acc_buf, mag_acc);
+    // Step 1: 去除 DC 分量
+    float32_t acc_buf_dcd[FFT_SIZE];
+    float32_t mean = 0.0f;
+    
+    // 计算均值
+    for (int i = 0; i < FFT_SIZE; i++) {
+        mean += acc_buf[i];
+    }
+    mean /= FFT_SIZE;
 
-    // 找峰值
-    uint32_t idx; float32_t val;
-    arm_max_f32(mag_acc, FFT_SIZE/2, &val, &idx);
+    // 去除 DC 分量
+    for (int i = 0; i < FFT_SIZE; i++) {
+        acc_buf_dcd[i] = acc_buf[i] - mean;
+    }
 
-    // 填结果
+    // Step 2: 打印去除 DC 分量后的 acc_buf（可选）
+    // for (int i = 0; i < 10; i++) {
+    //     printf("acc_buf[%d] = %d.%03d\n", i, (int)(acc_buf_dcd[i]), (int)(acc_buf_dcd[i] * 1000) % 1000);
+    // }
+
+    // Step 3: 做 FFT
+    computeFFT(acc_buf_dcd, mag_acc);
+
+    // Step 4: 打印 FFT 结果
+    // for (int i = 0; i < FFT_SIZE / 2; i++) {
+    //     printf("FFT Bin %d: %d\n", i, mag_acc[i]);
+    // }
+
+    // Step 5: 找峰值
+    uint32_t idx; 
+    float32_t val;
+    arm_max_f32(mag_acc, FFT_SIZE / 2, &val, &idx);
+
+    // Step 6: 填结果
     Detection d;
     d.freq      = idx * (SAMPLE_RATE / FFT_SIZE);
     d.magnitude = val;
-    d.detected  = (d.freq >= 3.0f && d.freq <= 5.0f);
+
+    // Adjust frequency range to account for possible higher frequency tremors
+    d.detected  = (d.freq >= 2.0f && d.freq <= 10.0f); // 允许的震颤频段范围
+
+    // Step 7: 打印调试信息
+    // printf("Peak Idx : %lu\n", idx);
+    // printf("Peak Freq: %d.%03d Hz\n", (int)(d.freq), (int)(d.freq * 1000) % 1000);
+    // printf("Peak Mag : %d.%03d\n", (int)(d.magnitude), (int)(d.magnitude * 1000) % 1000);
+
+    if (d.detected) {
+        printf("[Tremor Detected]\n");
+    } else {
+        printf("[No Tremor]\n");
+    }
+
     return d;
 }
+
+
 // 舞蹈症检测：同上 
 Detection detectDyskinesiaFFT(const float32_t gyro_buf[]) {
-    computeFFT(gyro_buf, mag_gyro);
+    // Step 1: 去除 DC 分量
+    float32_t gyro_buf_dcd[FFT_SIZE];
+    float32_t mean = 0.0f;
+    
+    // 计算均值
+    for (int i = 0; i < FFT_SIZE; i++) {
+        mean += gyro_buf[i];
+    }
+    mean /= FFT_SIZE;
 
-    uint32_t idx; float32_t val;
-    arm_max_f32(mag_gyro, FFT_SIZE/2, &val, &idx);
+    // 去除 DC 分量
+    for (int i = 0; i < FFT_SIZE; i++) {
+        gyro_buf_dcd[i] = gyro_buf[i] - mean;
+    }
 
+    // Step 2: 打印去除 DC 分量后的 gyro_buf（可选）
+    // for (int i = 0; i < 10; i++) {
+    //     printf("gyro_buf[%d] = %d.%03d\n", i, (int)(gyro_buf_dcd[i]), (int)(gyro_buf_dcd[i] * 1000) % 1000);
+    // }
+
+    // Step 3: 做 FFT
+    computeFFT(gyro_buf_dcd, mag_gyro);
+
+    // Step 4: 打印 FFT 结果
+    // for (int i = 0; i < FFT_SIZE / 2; i++) {
+    //     printf("FFT Bin %d: %f\n", i, mag_gyro[i]);
+    // }
+
+    // Step 5: 找峰值
+    uint32_t idx; 
+    float32_t val;
+    arm_max_f32(mag_gyro, FFT_SIZE / 2, &val, &idx);
+
+    // Step 6: 填结果
     Detection d;
     d.freq      = idx * (SAMPLE_RATE / FFT_SIZE);
     d.magnitude = val;
-    d.detected  = (d.freq > 5.0f && d.freq <= 7.0f);
+
+    // Step 7: 判断频段范围 5.0 ~ 7.0 Hz（异动症）
+    d.detected  = (d.freq > 0.5f && d.freq <= 3); // 允许的异动症频段范围
+
+    // Step 8: 打印调试信息
+    //printf("Peak Idx : %lu\n", idx);
+    //printf("Peak Freq: %d.%03d Hz\n", (int)(d.freq), (int)(d.freq * 1000) % 1000);
+    //printf("Peak Mag : %d.%03d\n", (int)(d.magnitude), (int)(d.magnitude * 1000) % 1000);
+
+    if (d.detected) {
+        printf("[Dyskinesia Detected]\n");
+    } else {
+        printf("[No Dyskinesia]\n");
+    }
+
     return d;
 }
 
+
 int main(){
+    ThisThread::sleep_for(500ms);  // 给串口初始化留时间
+    printf("Starting system...\r\n");
 
     //初始化硬件
     init_I2C();
@@ -208,18 +308,23 @@ int main(){
         float gyro_z_dps=tranformGyroscope(gyro_z_raw);
 
         // 打印采集的数据
-        printf("Accel [g]: X=%+6.3f, Y=%+6.3f, Z=%+6.3f | Gyro [dps]: X=%+7.2f, Y=%+7.2f, Z=%+7.2f\r\n", 
-            acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps);
+        //printf("Accel [g]: X=%+6.3f, Y=%+6.3f, Z=%+6.3f | Gyro [dps]: X=%+7.2f, Y=%+7.2f, Z=%+7.2f\r\n", 
+            //acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps);
         
         //进行频谱分析
         //xyz方向数据融合
         float acc_mag = sqrt(acc_x_g * acc_x_g + acc_y_g * acc_y_g + acc_z_g * acc_z_g);
         float gyro_mag = sqrt(gyro_x_dps * gyro_x_dps + gyro_y_dps * gyro_y_dps + gyro_z_dps * gyro_z_dps);
-
+        int acc_mag_int = (int)(acc_mag * 1000);
+        int gyro_mag_int = (int)(gyro_mag * 1000);
+        //printf("Acc_Mag: %d.%03d\r\n", acc_mag_int / 1000, acc_mag_int % 1000);
+        //fflush(stdout);
         //填入各自缓冲
-        input_acc[index]  = acc_mag;
-        input_gyro[index] = gyro_mag;
+        input_acc[index]  = acc_mag_int;
+        input_gyro[index] = gyro_mag_int;
         index++;
+        //printf("Index: %d\n", index);
+        //printf("Input Acc: %d.%03d | Input Gyro: %d.%03d | Index: %d\n", (int)(acc_mag * 1000) / 1000, (int)(acc_mag * 1000) % 1000, (int)(gyro_mag * 1000) / 1000, (int)(gyro_mag * 1000) % 1000, index);
 
         // 如果填充满了整个 FFT 数组，执行 FFT
         if (index >= FFT_SIZE) {
