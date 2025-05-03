@@ -195,7 +195,7 @@ Detection detectTremorFFT(const float32_t acc_buf[]) {
     d.freq      = idx * (SAMPLE_RATE / FFT_SIZE);
     d.magnitude = val;
 
-    // Adjust frequency range to account for possible higher frequency tremors
+    // 设置为2-10hz
     d.detected  = (d.freq >= 2.0f && d.freq <= 10.0f); // 允许的震颤频段范围
 
     // Step 7: 打印调试信息
@@ -253,7 +253,7 @@ Detection detectDyskinesiaFFT(const float32_t gyro_buf[]) {
     d.freq      = idx * (SAMPLE_RATE / FFT_SIZE);
     d.magnitude = val;
 
-    // Step 7: 判断频段范围 5.0 ~ 7.0 Hz（异动症）
+    // Step 7: 判断频段范围 0.5 ~ 3 Hz（异动症）
     d.detected  = (d.freq > 0.5f && d.freq <= 3); // 允许的异动症频段范围
 
     // Step 8: 打印调试信息
