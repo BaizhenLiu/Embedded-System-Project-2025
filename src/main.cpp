@@ -2,7 +2,41 @@
 #include "arm_math.h" 
 #include <cmath>
 #include <chrono>
+#include "ble/BLE.h"
+#include "ble/Gap.h"
+#include "ble/gap/AdvertisingDataBuilder.h"
+#include "platform/Callback.h"
+#include "ble/GattServer.h"
+
 using namespace std::chrono_literals;
+using namespace std::chrono;
+
+volatile bool is_connected = false;
+// LED 指示震颤状态
+DigitalOut led(LED1);
+
+// BLE 实例和事件队列
+BLE &ble_interface = BLE::Instance();
+events::EventQueue event_queue;
+
+// 自定义 BLE UUID
+const UUID tremorServiceUUID("e7810a71-73ae-499d-8c15-faa9aef0c3f2");
+const UUID tremorCharUUID("befc5c1c-a5d0-42db-a6c2-c0bfa020e50d");
+
+class GapEventHandler : public ble::Gap::EventHandler {
+    void onConnectionComplete(const ble::ConnectionCompleteEvent &event) override {
+        is_connected = true;
+        printf("[BLE] Connected\n");
+    }
+
+    void onDisconnectionComplete(const ble::DisconnectionCompleteEvent &event) override {
+        is_connected = false;
+        printf("[BLE] Disconnected\n");
+
+        // 断开后重新开始广播
+        BLE::Instance().gap().startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
+    }
+};
 
 
 I2C i2c(PB_11, PB_10);  // I2C2: SDA = PB11, SCL = PB10
@@ -37,6 +71,7 @@ FileHandle *mbed::mbed_override_console(int) {
 #define FFT_SIZE 256
 // #define SAMPLE_RATE 10000.0f
 #define SAMPLE_RATE 104.0f 
+uint8_t tremor_value[2] = {0, 0};
 
 float32_t input_acc[FFT_SIZE];
 float32_t input_gyro[FFT_SIZE];
@@ -46,6 +81,80 @@ static float32_t mag_acc[FFT_SIZE/2];      // 加速度 FFT 幅值
 static float32_t mag_gyro[FFT_SIZE/2]; 
 
 arm_rfft_fast_instance_f32 FFT_Instance;
+
+uint8_t tremor_state = 0; // 0 = 正常, 1 = 抖动报警
+GattCharacteristic tremorChar(
+    tremorCharUUID,               // UUID
+    tremor_value,                 // 初始值指针
+    sizeof(tremor_value),        // 最小长度
+    sizeof(tremor_value),        // 最大长度
+    GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY |
+    GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_READ,  // 权限
+    nullptr,                     // 无描述符
+    0,                           // 描述符数量为 0
+    false                        // 不使用 variable length
+);
+
+
+
+// 修正：使用一个指向 GattCharacteristic 的指针数组
+GattCharacteristic* characteristics[] = { &tremorChar };
+
+// 创建 GattService 时传入指向 GattCharacteristic 的指针数组
+GattService tremorService(tremorServiceUUID, characteristics, 1);
+
+void update_tremor_state() {
+    static int counter = 0;
+    counter++;
+
+    if (true) {
+        tremor_state = (tremor_state == 0) ? 1 : 0;
+        led = tremor_state;
+
+        // 通知更新震颤状态
+        ble_interface.gattServer().write(tremorChar.getValueHandle(), &tremor_state, sizeof(tremor_state));
+        printf("Tremor state updated: %d\n", tremor_state);
+    }
+}
+
+void schedule_ble_events(BLE::OnEventsToProcessCallbackContext *context) {
+    event_queue.call(callback(&ble_interface, &BLE::processEvents));
+}
+
+void on_init_complete(BLE::InitializationCompleteCallbackContext *params) {
+    if (params->error != BLE_ERROR_NONE) {
+        printf("BLE init failed.\n");
+        return;
+    }
+
+    // 设置 GAP 事件处理器（处理连接/断开事件）
+    static GapEventHandler gap_handler;
+    ble_interface.gap().setEventHandler(&gap_handler);
+
+    // 添加自定义 GATT 服务
+    ble_interface.gattServer().addService(tremorService);
+
+    // 设置广播参数
+    ble::AdvertisingParameters adv_params(
+        ble::advertising_type_t::CONNECTABLE_UNDIRECTED,
+        ble::adv_interval_t(ble::millisecond_t(1000))
+    );
+
+    // 设置广播内容
+    static uint8_t adv_buffer[ble::LEGACY_ADVERTISING_MAX_SIZE];
+    ble::AdvertisingDataBuilder adv_data_builder(adv_buffer);
+    adv_data_builder.setFlags();
+    adv_data_builder.setName("TremorBLE"); // 广播名称，在手机 BLE 工具中能看到
+
+    ble_interface.gap().setAdvertisingParameters(ble::LEGACY_ADVERTISING_HANDLE, adv_params);
+    ble_interface.gap().setAdvertisingPayload(ble::LEGACY_ADVERTISING_HANDLE, adv_data_builder.getAdvertisingData());
+
+    // 启动广播
+    ble_interface.gap().startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
+    printf("BLE service started. You can now connect from phone.\n");
+}
+
+
 
 // Write a value to a register
 void write_register(uint8_t reg, uint8_t value) {
@@ -254,12 +363,14 @@ Detection detectDyskinesiaFFT(const float32_t gyro_buf[]) {
     d.magnitude = val;
 
     // Step 7: 判断频段范围 0.5 ~ 3 Hz（异动症）
-    d.detected  = (d.freq > 0.5f && d.freq <= 3); // 允许的异动症频段范围
-
-    // Step 8: 打印调试信息
-    //printf("Peak Idx : %lu\n", idx);
-    //printf("Peak Freq: %d.%03d Hz\n", (int)(d.freq), (int)(d.freq * 1000) % 1000);
-    //printf("Peak Mag : %d.%03d\n", (int)(d.magnitude), (int)(d.magnitude * 1000) % 1000);
+    const float32_t DYSK_FREQ_MIN = 0.5f;
+    const float32_t DYSK_FREQ_MAX = 3.0f;
+    const float32_t DYSK_MAG_THRESHOLD = 10.0f;
+    d.detected = (
+        d.freq > DYSK_FREQ_MIN && 
+        d.freq <= DYSK_FREQ_MAX &&
+        d.magnitude >= DYSK_MAG_THRESHOLD
+    ); // 允许的异动症频段范围
 
     if (d.detected) {
         printf("[Dyskinesia Detected]\n");
@@ -269,11 +380,112 @@ Detection detectDyskinesiaFFT(const float32_t gyro_buf[]) {
 
     return d;
 }
+int fft_index = 0;
+void sample_and_process() {
+    // 读取传感器原始值
+    int16_t acc_x_raw = read_16bit_value(OUTX_L_XL, OUTX_H_XL);
+    int16_t acc_y_raw = read_16bit_value(OUTY_L_XL, OUTY_H_XL);
+    int16_t acc_z_raw = read_16bit_value(OUTZ_L_XL, OUTZ_H_XL);
+
+    int16_t gyro_x_raw = read_16bit_value(OUTX_L_G, OUTX_H_G);
+    int16_t gyro_y_raw = read_16bit_value(OUTY_L_G, OUTY_H_G);
+    int16_t gyro_z_raw = read_16bit_value(OUTZ_L_G, OUTZ_H_G);
+
+    // 单位转换
+    float acc_x_g = transformAccelerometer(acc_x_raw);
+    float acc_y_g = transformAccelerometer(acc_y_raw);
+    float acc_z_g = transformAccelerometer(acc_z_raw);
+
+    float gyro_x_dps = tranformGyroscope(gyro_x_raw);
+    float gyro_y_dps = tranformGyroscope(gyro_y_raw);
+    float gyro_z_dps = tranformGyroscope(gyro_z_raw);
+
+    // 计算模长
+    float acc_mag = sqrt(acc_x_g * acc_x_g + acc_y_g * acc_y_g + acc_z_g * acc_z_g);
+    float gyro_mag = sqrt(gyro_x_dps * gyro_x_dps + gyro_y_dps * gyro_y_dps + gyro_z_dps * gyro_z_dps);
+
+    // 存入 FFT 输入数组
+    input_acc[fft_index]  = (int)(acc_mag * 1000);
+    input_gyro[fft_index] = (int)(gyro_mag * 1000);
+    fft_index++;
+
+    // 到达 FFT 数据窗口后进行处理
+    if (fft_index >= FFT_SIZE) {
+        Detection tremor = detectTremorFFT(input_acc);
+        Detection dysk   = detectDyskinesiaFFT(input_gyro);
+        fft_index = 0;
+
+
+        // 本地串口打印信息
+        if (tremor.detected) {
+            printf("[Tremor Detected] Peak Frequency: %.2f Hz | Magnitude: %.4f\r\n", tremor.freq, tremor.magnitude);
+        }
+
+        if (dysk.detected) {
+            printf("[Dyskinesia Detected] Peak Frequency: %.2f Hz | Magnitude: %.4f\r\n", dysk.freq, dysk.magnitude);
+        }
+
+        // BLE 通知连接设备
+        if (!is_connected) {
+            printf("[ERROR] Not connected to BLE device!\r\n");
+            return;
+        }
+        if (is_connected) {
+            if (!GattCharacteristic::isWritable(tremorChar.getProperties())) {
+    printf("[ERROR] GATT characteristic is not writable.\r\n");
+} 
+    uint8_t msg[2]; // 使用 2 字节，分别表示 Tremor 和 Dyskinesia 的状态
+
+    // 打印连接状态
+    printf("[DEBUG] is_connected = %d\n", is_connected);
+
+    // 打印 tremor 和 dysk 的检测状态
+    printf("[DEBUG] tremor.detected = %d, dysk.detected = %d\n", tremor.detected, dysk.detected);
+
+    // 设置 tremor 和 dysk 的数值
+    msg[0] = tremor.detected ? 1 : 0;  // 1 表示震颤检测，0 表示无震颤
+    msg[1] = dysk.detected ? 2 : 0;    // 2 表示异动症检测，0 表示无异动症
+
+    // 打印 msg 数组的内容
+    printf("[DEBUG] msg[0] = %d, msg[1] = %d\n", msg[0], msg[1]);
+
+    // 打印 GATT 特征句柄
+    printf("[DEBUG] GATT Characteristic Handle: %d\n", tremorChar.getValueHandle());
+
+    // 写入数据
+    ble_error_t err = ble_interface.gattServer().write(
+        tremorChar.getValueHandle(),
+        msg,  // 发送原始的数值
+        sizeof(msg)  // 发送 2 字节数据
+    );
+
+    
+    // 检查 BLE 写入错误
+    if (err) {
+        printf("[ERROR] BLE write failed: %d\r\n", err);
+    } else {
+        printf("[BLE Notify] Tremor: %d Dyskinesia: %d\r\n", msg[0], msg[1]);
+    }
+} else {
+    printf("[ERROR] Not connected to BLE device!\r\n");
+}
+
+
+    }
+}
+
 
 
 int main(){
     ThisThread::sleep_for(500ms);  // 给串口初始化留时间
     printf("Starting system...\r\n");
+    printf("Starting BLE Tremor Monitor...\n");
+
+
+    // 初始化 BLE
+    ble_interface.onEventsToProcess(schedule_ble_events);
+    ble_interface.init(on_init_complete);
+
 
     //初始化硬件
     init_I2C();
@@ -285,66 +497,7 @@ int main(){
     configure_sensor();
     //初始化 ARM FFT 实例
     arm_rfft_fast_init_f32(&FFT_Instance, FFT_SIZE);
-    int index = 0; 
     constexpr auto SAMPLE_PERIOD = 1000ms / 104;
-    //精度有误差，后续需要调整
-
-    while(1){
-        //收集打印数据
-        int16_t acc_x_raw = read_16bit_value(OUTX_L_XL, OUTX_H_XL);
-        int16_t acc_y_raw = read_16bit_value(OUTY_L_XL, OUTY_H_XL);
-        int16_t acc_z_raw = read_16bit_value(OUTZ_L_XL, OUTZ_H_XL);
-
-        int16_t gyro_x_raw = read_16bit_value(OUTX_L_G, OUTX_H_G);
-        int16_t gyro_y_raw = read_16bit_value(OUTY_L_G, OUTY_H_G);
-        int16_t gyro_z_raw = read_16bit_value(OUTZ_L_G, OUTZ_H_G);
-
-        float acc_x_g=transformAccelerometer(acc_x_raw);
-        float acc_y_g=transformAccelerometer(acc_y_raw);
-        float acc_z_g=transformAccelerometer(acc_z_raw);
-
-        float gyro_x_dps=tranformGyroscope(gyro_x_raw);
-        float gyro_y_dps=tranformGyroscope(gyro_y_raw);
-        float gyro_z_dps=tranformGyroscope(gyro_z_raw);
-
-        // 打印采集的数据
-        //printf("Accel [g]: X=%+6.3f, Y=%+6.3f, Z=%+6.3f | Gyro [dps]: X=%+7.2f, Y=%+7.2f, Z=%+7.2f\r\n", 
-            //acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps);
-        
-        //进行频谱分析
-        //xyz方向数据融合
-        float acc_mag = sqrt(acc_x_g * acc_x_g + acc_y_g * acc_y_g + acc_z_g * acc_z_g);
-        float gyro_mag = sqrt(gyro_x_dps * gyro_x_dps + gyro_y_dps * gyro_y_dps + gyro_z_dps * gyro_z_dps);
-        int acc_mag_int = (int)(acc_mag * 1000);
-        int gyro_mag_int = (int)(gyro_mag * 1000);
-        //printf("Acc_Mag: %d.%03d\r\n", acc_mag_int / 1000, acc_mag_int % 1000);
-        //fflush(stdout);
-        //填入各自缓冲
-        input_acc[index]  = acc_mag_int;
-        input_gyro[index] = gyro_mag_int;
-        index++;
-        //printf("Index: %d\n", index);
-        //printf("Input Acc: %d.%03d | Input Gyro: %d.%03d | Index: %d\n", (int)(acc_mag * 1000) / 1000, (int)(acc_mag * 1000) % 1000, (int)(gyro_mag * 1000) / 1000, (int)(gyro_mag * 1000) % 1000, index);
-
-        // 如果填充满了整个 FFT 数组，执行 FFT
-        if (index >= FFT_SIZE) {
-            Detection tremor = detectTremorFFT(input_acc);
-            Detection dysk  = detectDyskinesiaFFT(input_gyro);
-            index = 0;
-            if (tremor.detected) {
-                printf("[Tremor Detected] Peak Frequency: %.2f Hz | Magnitude: %.4f\r\n", tremor.freq, tremor.magnitude);
-            }
-        
-            // 根据 dysk.detected / dysk.magnitude 做陀螺指示
-            if (dysk.detected) {
-                printf("[Dyskinesia Detected] Peak Frequency: %.2f Hz | Magnitude: %.4f\r\n", dysk.freq, dysk.magnitude);
-            }
-        }
-           
-        // 等待下一次采样
-        ThisThread::sleep_for(SAMPLE_PERIOD);
-
-    }
-
-
+    event_queue.call_every(SAMPLE_PERIOD, sample_and_process);
+    event_queue.dispatch_forever();
 }
