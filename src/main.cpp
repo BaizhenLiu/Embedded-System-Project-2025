@@ -12,14 +12,11 @@ using namespace std::chrono_literals;
 using namespace std::chrono;
 
 volatile bool is_connected = false;
-// LED 指示震颤状态
 DigitalOut led(LED1);
 
-// BLE 实例和事件队列
 BLE &ble_interface = BLE::Instance();
 events::EventQueue event_queue;
 
-// 自定义 BLE UUID
 const UUID tremorServiceUUID("e7810a71-73ae-499d-8c15-faa9aef0c3f2");
 const UUID tremorCharUUID("befc5c1c-a5d0-42db-a6c2-c0bfa020e50d");
 
@@ -305,7 +302,7 @@ Detection detectTremorFFT(const float32_t acc_buf[]) {
     d.magnitude = val;
 
     // 设置为2-10hz
-    d.detected  = (d.freq >= 2.0f && d.freq <= 10.0f); // 允许的震颤频段范围
+    d.detected  = (d.freq >= 5.0f && d.freq <= 10.0f); // 允许的震颤频段范围
 
     // Step 7: 打印调试信息
     // printf("Peak Idx : %lu\n", idx);
@@ -363,9 +360,9 @@ Detection detectDyskinesiaFFT(const float32_t gyro_buf[]) {
     d.magnitude = val;
 
     // Step 7: 判断频段范围 0.5 ~ 3 Hz（异动症）
-    const float32_t DYSK_FREQ_MIN = 0.5f;
+    const float32_t DYSK_FREQ_MIN = 1.0f;
     const float32_t DYSK_FREQ_MAX = 3.0f;
-    const float32_t DYSK_MAG_THRESHOLD = 10.0f;
+    const float32_t DYSK_MAG_THRESHOLD = 10000.0f;
     d.detected = (
         d.freq > DYSK_FREQ_MIN && 
         d.freq <= DYSK_FREQ_MAX &&
@@ -418,11 +415,15 @@ void sample_and_process() {
 
         // 本地串口打印信息
         if (tremor.detected) {
-            printf("[Tremor Detected] Peak Frequency: %.2f Hz | Magnitude: %.4f\r\n", tremor.freq, tremor.magnitude);
+            int freq_int = (int)(tremor.freq * 100);         // 保留两位小数
+            int mag_int = (int)(tremor.magnitude * 10000);   // 保留四位小数
+            printf("[Tremor Detected] Peak Frequency: %d (x0.01 Hz) | Magnitude: %d (x0.0001)\r\n", freq_int, mag_int);
         }
 
         if (dysk.detected) {
-            printf("[Dyskinesia Detected] Peak Frequency: %.2f Hz | Magnitude: %.4f\r\n", dysk.freq, dysk.magnitude);
+            int freq_int = (int)(dysk.freq * 100);
+            int mag_int = (int)(dysk.magnitude * 10000);
+            printf("[Dyskinesia Detected] Peak Frequency: %d (x0.01 Hz) | Magnitude: %d (x0.0001)\r\n", freq_int, mag_int);
         }
 
         // BLE 通知连接设备
